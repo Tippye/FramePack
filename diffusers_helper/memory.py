@@ -82,7 +82,7 @@ def get_cuda_free_memory_gb(device=None):
 
 
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
-    print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
+    # print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
 
     for m in model.modules():
         if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
@@ -98,7 +98,7 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
 
 
 def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0):
-    print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
+    # print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
     for m in model.modules():
         if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
@@ -116,7 +116,7 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
 def unload_complete_models(*args):
     for m in gpu_complete_modules + list(args):
         m.to(device=cpu)
-        print(f'Unloaded {m.__class__.__name__} as complete.')
+        # print(f'Unloaded {m.__class__.__name__} as complete.')
 
     gpu_complete_modules.clear()
     torch.cuda.empty_cache()
@@ -128,7 +128,7 @@ def load_model_as_complete(model, target_device, unload=True):
         unload_complete_models()
 
     model.to(device=target_device)
-    print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
+    # print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
 
     gpu_complete_modules.append(model)
     return
