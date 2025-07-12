@@ -2,9 +2,6 @@ from diffusers_helper.hf_login import login
 
 import os
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
-
-import gradio as gr
 import torch
 import traceback
 import einops
@@ -21,24 +18,43 @@ from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, so
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
-from diffusers_helper.thread_utils import AsyncStream, async_run
-from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
+# from diffusers_helper.thread_utils import AsyncStream, async_run # 移除 Gradio 相关的线程工具
+# from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html # 移除 Gradio UI 工具
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
+import oss2
+
+bucket = oss2.Bucket(
+    oss2.Auth(*tuple(open('oss_aksk.txt').read().strip().split('\n'))),
+	'oss-cn-hangzhou.aliyuncs.com', 'metac-video-pitcturebook'
+)
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
-parser.add_argument("--port", type=int, required=False)
-parser.add_argument("--inbrowser", action='store_true')
+# 添加执行所需的参数
+parser.add_argument("--input_image", type=str, required=True, help="Path to the input image.")
+parser.add_argument("--prompt", type=str, required=True, help="Positive prompt.")
+parser.add_argument("--n_prompt", type=str, default="", help="Negative prompt.")
+parser.add_argument("--seed", type=int, default=31337, help="Random seed.")
+parser.add_argument("--total_second_length", type=float, default=5.0, help="Total video length in seconds.")
+parser.add_argument("--steps", type=int, default=25, help="Number of diffusion steps.")
+parser.add_argument("--gs", type=float, default=10.0, help="Distilled CFG Scale.")
+parser.add_argument("--mp4_crf", type=int, default=16, help="MP4 CRF value (lower means better quality).")
+parser.add_argument("--output_dir", type=str, default='./outputs/', help="Directory to save the output video.")
+parser.add_argument("--gpu_memory_preservation", type=float, default=6.0, help="GPU memory to preserve during inference (GB).")
+parser.add_argument("--use_teacache", action='store_true', help="Enable TeaCache optimization.")
+# 保留或移除 Gradio 特定的参数，根据需要
+# parser.add_argument('--share', action='store_true')
+# parser.add_argument("--server", type=str, default='0.0.0.0')
+# parser.add_argument("--port", type=int, required=False)
+# parser.add_argument("--inbrowser", action='store_true')
 args = parser.parse_args()
 
-# for win desktop probably use --server 127.0.0.1 --inbrowser
-# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
-
 print(args)
+
+# --- 模型加载和设置代码保持不变 ---
+os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
@@ -83,7 +99,6 @@ image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
 if not high_vram:
-    # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
     DynamicSwapInstaller.install_model(transformer, device=gpu)
     DynamicSwapInstaller.install_model(text_encoder, device=gpu)
 else:
@@ -93,20 +108,28 @@ else:
     vae.to(gpu)
     transformer.to(gpu)
 
-stream = AsyncStream()
+# stream = AsyncStream() # 移除
 
-outputs_folder = './outputs/'
+outputs_folder = args.output_dir # 使用参数指定的输出目录
 os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def generate_video(input_image_path, prompt, n_prompt, seed, total_second_length, steps, gs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # --- 从 worker 函数改编的核心逻辑 ---
+    # 固定或移除 worker 中依赖 Gradio 的参数
+    latent_window_size = 9 # 固定值
+    cfg = 1.0 # 固定值
+    rs = 0.0 # 固定值
+
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
+    final_output_filename = None
 
-    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+    # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...')))) # 移除 UI 更新
+    print('Starting ...')
 
     try:
         # Clean GPU
@@ -116,16 +139,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
 
         # Text encoding
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+        # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...')))) # 移除 UI 更新
+        print('Text encoding ...')
 
         if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
+            fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        if cfg == 1:
+        if cfg == 1: # 保持逻辑，即使 cfg 固定
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
             llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
@@ -134,21 +157,26 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
         # Processing input image
+        # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...')))) # 移除 UI 更新
+        print('Image processing ...')
 
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
+        # 从文件加载图像
+        input_image = Image.open(input_image_path).convert('RGB')
+        input_image = np.array(input_image)
 
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        # 保存处理后的输入图像（可选）
+        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}_input.png'))
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
+        # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...')))) # 移除 UI 更新
+        print('VAE encoding ...')
 
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
@@ -156,8 +184,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
+        # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...')))) # 移除 UI 更新
+        print('CLIP Vision encoding ...')
 
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
@@ -166,7 +194,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Dtype
-
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -174,8 +201,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
         # Sampling
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+        # stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...')))) # 移除 UI 更新
+        print('Start sampling ...')
 
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
@@ -187,24 +214,19 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         latent_paddings = reversed(range(total_latent_sections))
 
         if total_latent_sections > 4:
-            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
-            # items looks better than expanding it when total_latent_sections > 4
-            # One can try to remove below trick and just
-            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
-            if stream.input_queue.top() == 'end':
-                stream.output_queue.push(('end', None))
-                return
+            # if stream.input_queue.top() == 'end': # 移除 Gradio 停止逻辑
+            #     stream.output_queue.push(('end', None))
+            #     return
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            # [0]                      [1,..., 27]     [28, ..., 36],  [37],                   [38, 39]                    [40, ...]
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
@@ -222,21 +244,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 transformer.initialize_teacache(enable_teacache=False)
 
             def callback(d):
-                preview = d['denoised']
-                preview = vae_decode_fake(preview)
+                # 移除预览生成和 UI 更新
+                # preview = d['denoised']
+                # preview = vae_decode_fake(preview)
+                # preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                # preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
-
-                if stream.input_queue.top() == 'end':
-                    stream.output_queue.push(('end', None))
-                    raise KeyboardInterrupt('User ends the task.')
+                # if stream.input_queue.top() == 'end': # 移除 Gradio 停止逻辑
+                #     stream.output_queue.push(('end', None))
+                #     raise KeyboardInterrupt('User ends the task.')
 
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
                 hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
-                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                # desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
+                # stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint)))) # 移除 UI 更新
+                print(f"  Step: {current_step}/{steps} ({percentage}%)") # 打印进度到控制台
                 return
 
             generated_latents = sample_hunyuan(
@@ -245,11 +268,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 width=width,
                 height=height,
                 frames=num_frames,
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=gs,
-                guidance_rescale=rs,
-                # shift=3.0,
-                num_inference_steps=steps,
+                real_guidance_scale=cfg, # 使用固定的 cfg
+                distilled_guidance_scale=gs, # 使用参数 gs
+                guidance_rescale=rs, # 使用固定的 rs
+                num_inference_steps=steps, # 使用参数 steps
                 generator=rnd,
                 prompt_embeds=llama_vec,
                 prompt_embeds_mask=llama_attention_mask,
@@ -294,117 +316,57 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             if not high_vram:
                 unload_complete_models()
 
-            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-
+            # 保存中间或最终视频
+            output_filename = os.path.join(outputs_folder, f'{job_id}.mp4') # 使用固定的最终文件名
             save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
+            final_output_filename = output_filename # 更新最终文件名
 
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
+            print(f'Saved intermediate video to {output_filename}')
 
-            stream.output_queue.push(('file', output_filename))
+            # stream.output_queue.push(('file', output_filename)) # 移除 UI 更新
 
             if is_last_section:
                 break
-    except:
+    except Exception as e: # 使用更通用的异常处理
         traceback.print_exc()
-
+        print(f"Error during generation: {e}")
+    finally: # 确保模型在结束或出错时卸载
         if not high_vram:
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
 
-    stream.output_queue.push(('end', None))
-    return
+    # stream.output_queue.push(('end', None)) # 移除 UI 更新
+    print('Generation finished.')
+    return final_output_filename # 返回最终文件路径
 
+# --- 移除 Gradio UI 定义和启动代码 ---
+# def process(...): ...
+# def end_process(...): ...
+# block = gr.Blocks(...)
+# with block: ...
+# block.launch(...)
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
-    global stream
-    assert input_image is not None, 'No input image!'
+if __name__ == "__main__":
+    if not os.path.exists(args.input_image):
+        print(f"Error: Input image not found at {args.input_image}")
+        exit(1)
 
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    output_video_path = generate_video(
+        input_image_path=args.input_image,
+        prompt=args.prompt,
+        n_prompt=args.n_prompt,
+        seed=args.seed,
+        total_second_length=args.total_second_length,
+        steps=args.steps,
+        gs=args.gs,
+        gpu_memory_preservation=args.gpu_memory_preservation,
+        use_teacache=args.use_teacache,
+        mp4_crf=args.mp4_crf
+    )
 
-    stream = AsyncStream()
-
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
-
-    output_filename = None
-
-    while True:
-        flag, data = stream.output_queue.next()
-
-        if flag == 'file':
-            output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
-
-        if flag == 'progress':
-            preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
-
-        if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
-            break
-
-
-def end_process():
-    stream.input_queue.push('end')
-
-
-quick_prompts = [
-    'The girl dances gracefully, with clear movements, full of charm.',
-    'A character doing some simple body movements.',
-]
-quick_prompts = [[x] for x in quick_prompts]
-
-
-css = make_progress_bar_css()
-block = gr.Blocks(css=css).queue()
-with block:
-    gr.Markdown('# FramePack')
-    with gr.Row():
-        with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
-            prompt = gr.Textbox(label="Prompt", value='')
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
-
-            with gr.Row():
-                start_button = gr.Button(value="Start Generation")
-                end_button = gr.Button(value="End Generation", interactive=False)
-
-            with gr.Group():
-                use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
-                seed = gr.Number(label="Seed", value=31337, precision=0)
-
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
-
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
-                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
-                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
-
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
-
-                mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
-
-        with gr.Column():
-            preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
-            gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
-            progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
-            progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-
-    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
-
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
-    end_button.click(fn=end_process)
-
-
-block.launch(
-    server_name=args.server,
-    server_port=args.port,
-    share=args.share,
-    inbrowser=args.inbrowser,
-)
+    if output_video_path:
+        print(f"Successfully generated video: {output_video_path}")
+    else:
+        print("Video generation failed.")
